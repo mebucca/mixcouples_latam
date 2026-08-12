@@ -1,0 +1,581 @@
+---
+title: "Tipologías de Parejas Convivientes en Chile: Análisis Exploratorio con Datos del Censo 2024"
+date: today
+lang: es
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-title: "Contenidos"
+    number-sections: true
+    code-fold: true
+    code-summary: "Ver código"
+    highlight-style: github
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  freeze: auto
+---
+
+```{r setup}
+#| label: setup
+#| code-summary: "Carga de librerías y configuración"
+
+library(tidyverse)
+library(fastDummies)
+library(cluster)
+library(ranger)
+library(ggplot2)
+
+set.seed(998213)
+
+chi_couples_stats <- readRDS("C:/Universidad/IPRE/IPre Bucca/chi_couples_stats.rds")
+```
+
+## Introducción
+
+Este trabajo presenta un análisis exploratorio de las parejas convivientes en Chile a partir de los datos del Censo 2024. El estudio busca responder dos preguntas complementarias: en primer lugar, ¿qué tipologías de parejas convivientes existen en el Chile de 2024?, y a partir de estas, ¿qué factores sociodemográficos son los más determinantes en la formación de parejas entre personas nativas y no nativas?
+
+El interés analítico central recae en el concepto de **homofilia**, entendida como la tendencia de los individuos a vincularse con pares que comparten características similares. En el contexto migratorio chileno, resulta relevante explorar en qué medida esta homofilia opera entre la población no nativa, y cómo se configura respecto a dimensiones como la educación, la ocupación, la religión y la presencia de hijos.
+
+### Fuente de datos y limitaciones
+
+Los datos provienen exclusivamente del **Censo de Población y Vivienda 2024** de Chile. Esta fuente permite trabajar con el universo completo de personas censadas, lo que otorga una cobertura sin precedentes para el estudio de las estructuras de convivencia. Sin embargo, presenta limitaciones relevantes:
+
+- **Restricción a parejas convivientes**: el censo solo registra personas que comparten un mismo hogar en el momento del levantamiento. Quedan fuera todas las relaciones de pareja que no implican convivencia, lo que subestima el universo real de parejas en Chile.
+- **Dependencia del autorreporte de parentesco**: la identificación de parejas se realiza a través de la variable de relación de parentesco con el jefe/a de hogar. Esto puede no capturar parejas de facto que no se declaran como tales, o situaciones de convivencia no reconocidas en el formulario censal.
+
+---
+
+## Datos y preparación
+
+### Selección y recodificación de variables
+
+El punto de partida es la base de personas del Censo 2024. En base a esta se seleccionaron las variables individuales de caracterización relevantes y se aplico un proceso de recodificación para una mayor facilidad de trabajo de los datos (buscando disminuir tiempos de procesado).
+
+Las recodificaciones principales son las siguientes:
+
+- **`educ_cat`**: colapsada en dos categorías — *Universitario* y *No Universitario* — combinando los niveles originales de educación básica, media y superior.
+- **`sit_fuerza_trabajo`**: distingue entre *Ocupado* y *Desocupado*, fusionando desocupados e inactivos.
+- **`ocupation`**: agrupada en tres categorías — *Profesional o Directivo*, *Técnico o Servicio* y *Obrero* — a partir de los códigos CIUO.
+- **`native`**: indica si la persona nació en Chile (*Native*) o en el extranjero (*Nonnative*), a partir de la variable de lugar de nacimiento.
+
+El siguiente fragmento ilustra la lógica de recodificación aplicada a nivel individual:
+
+```{r recodificacion-ejemplo}
+#| label: recodificacion-ejemplo
+#| eval: false
+#| code-summary: "Ejemplo de recodificación individual (no se ejecuta en el reporte)"
+
+censo_recod <- personas_censo2024 %>%
+  dplyr::select(id_vivienda, id_hogar, id_persona, sexo, edad, area, parentesco,
+                p25_lug_nacimiento_rec, p31_religion, p31_religion_rec,
+                educ_cat, sit_fuerza_trabajo, cod_ciuo, p46a_tot_hijs_nac) %>%
+  mutate(across(where(is.numeric), ~if_else(. %in% c(-99, -66, 999), NA_real_, .))) %>%
+  drop_na(id_vivienda:id_hogar, sexo, edad, area, parentesco,
+          p25_lug_nacimiento_rec, educ_cat, sit_fuerza_trabajo, cod_ciuo) %>%
+  mutate(
+    native = case_when(
+      p25_lug_nacimiento_rec == 1 ~ "Native",
+      p25_lug_nacimiento_rec == 2 ~ "Nonnative",
+      TRUE ~ NA_character_
+    ),
+    educ_cat = case_when(
+      educ_cat == "College or More" ~ "Universitario",
+      educ_cat %in% c("Less than primary", "Primary", "Secondary") ~ "No Universitario",
+      TRUE ~ NA_character_
+    ),
+    sit_fuerza_trabajo = case_when(
+      sit_fuerza_trabajo == 1        ~ "Ocupado",
+      sit_fuerza_trabajo %in% c(2,3) ~ "Desocupado",
+      TRUE ~ NA_character_
+    ),
+    ocupation = case_when(
+      cod_ciuo %in% c(1, 2)       ~ "Profesional o Directivo",
+      cod_ciuo %in% c(3, 4, 5, 0) ~ "Técnico o Servicio",
+      cod_ciuo %in% c(6, 7, 8)    ~ "Obrero",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+### Identificación y construcción de parejas
+
+Las parejas se identifican mediante un `inner_join` entre los jefes/as de hogar (`parentesco == 1`) y sus cónyuges o convivientes (`parentesco %in% c(2, 3, 4)`), usando como llave los identificadores de vivienda y hogar. Esto garantiza que cada pareja quede representada como una sola unidad de observación.
+
+Una vez unidas, las variables se reorganizan según el sexo de cada integrante — diferenciando *male partner* (mp) y *female partner* (fp) — para construir medidas a nivel de pareja:
+
+- `age_diff`: diferencia de edad categorizada en *Hombre Mayor*, *Mujer Mayor* o *Misma Edad* (±1 año).
+- `educ_cat_couple`: combinación educativa de ambos integrantes (ej. *Universitario-No Universitario*).
+- `native_couple`: combinación de origen migratorio (ej. *Native-Nonnative*).
+- `religion_couple`: homogamia religiosa — *Misma Religión*, *Distinta Religión* o *Sin Religión*.
+- `status_wf_couple`: situación laboral combinada.
+- `ocupation_couple`: combinación ocupacional de ambos integrantes.
+- `children_couple`: presencia de hijos, basada en si la mujer de la pareja tiene hijos nacidos vivos.
+- `area_couple`: área de residencia (urbano/rural), tomada desde el jefe de hogar.
+
+Se excluyen las parejas homosexuales del análisis por dos criterios: (1) representan una proporción pequeña de la muestra (26.765 casos frente a 1.353.297 heterosexuales), y (2) la construcción de variables diádicas basadas en género no es aplicable de forma sistemática a parejas del mismo sexo sin decisiones teóricas adicionales que exceden el alcance de este trabajo exploratorio.
+
+El resultado de este pipeline es el objeto `chi_couples_stats`, que contiene las variables a nivel de díada y constituye el punto de entrada de todos los análisis del reporte, set de datos al cual se realizaran los siguientes procesos: k-clustering y Random Forest.
+
+---
+
+## Metodología
+
+### Función auxiliar de clustering
+
+Para evitar repetición de código, se define una función que recibe un vector de tipos de pareja, construye la matriz de dummies, corre el elbow test y ajusta el modelo K-Means con k = 5.
+
+```{r funcion-clustering}
+#| label: funcion-clustering
+#| code-summary: "Función auxiliar: preparación de datos y K-Means"
+
+preparar_y_clusterizar <- function(datos, filtro, k = 5, max_k = 10, seed = 998213) {
+
+  # Filtrar y codificar dummies
+  clust_data <- datos %>%
+    filter(native_couple %in% filtro) %>%
+    dplyr::select(age_diff, educ_cat_couple, native_couple, religion_couple,
+                  status_wf_couple, ocupation_couple, children_couple, area_couple) %>%
+    drop_na() %>%
+    dummy_cols(
+      select_columns  = c("native_couple", "age_diff", "educ_cat_couple", "religion_couple",
+                          "status_wf_couple", "ocupation_couple", "children_couple", "area_couple"),
+      remove_selected_columns = TRUE,
+      remove_first_dummy      = FALSE
+    )
+
+  # Elbow test
+  wcss <- numeric(max_k)
+  for (k_i in seq_len(max_k)) {
+    set.seed(seed)
+    wcss[k_i] <- kmeans(clust_data, centers = k_i, nstart = 25)$tot.withinss
+  }
+
+  elbow_plot <- ggplot(data.frame(k = 1:max_k, wcss = wcss), aes(x = k, y = wcss)) +
+    geom_line(color = "steelblue", linewidth = 1.2) +
+    geom_point(color = "steelblue", size = 3) +
+    labs(x = "Número de clusters (k)", y = "WCSS (varianza intra-cluster total)") +
+    theme_minimal() +
+    scale_x_continuous(breaks = 1:max_k)
+
+  # K-Means final
+  set.seed(seed)
+  km     <- kmeans(clust_data, centers = k, nstart = 25)
+  result <- clust_data %>% mutate(cluster = factor(km$cluster))
+
+  # Perfil de centroides
+  perfil <- result %>%
+    group_by(cluster) %>%
+    summarise(across(everything(), ~mean(.x, na.rm = TRUE))) %>%
+    t()
+
+  # Distribución por cluster
+  dist <- result %>%
+    group_by(cluster) %>%
+    summarise(n = n()) %>%
+    mutate(porcentaje = round(n / sum(n) * 100, 1))
+
+  list(data = result, elbow = elbow_plot, perfil = perfil, distribucion = dist)
+}
+```
+
+### Etapa 1: Clustering K-Means
+
+El objetivo de la primera etapa es identificar tipologías de parejas convivientes a partir de sus características sociodemográficas. Se aplica **K-Means**, que agrupa observaciones minimizando la varianza intra-cluster (WCSS). 
+
+Las variables categóricas se convierten a dummies binarias mediante `dummy_cols()`. Se mantienen todas las categorías (`remove_first_dummy = FALSE`) para preservar la interpretabilidad completa de los perfiles de centroides.
+
+El análisis se realiza en **tres configuraciones** del filtro `native_couple`:
+
+1. MIGRANTES: Solo parejas con al menos un integrante no nativo: `c("Native-Nonnative", "Nonnative-Native", "Nonnative-Nonnative")`
+2. COMPLETA: Todas las combinaciones posibles: `c("Native-Native", "Native-Nonnative", "Nonnative-Native", "Nonnative-Nonnative")`
+3. HOMOGAMAS: Solo parejas homógamas en origen: `c("Native-Native", "Nonnative-Nonnative")`
+
+El número óptimo de clusters se determina mediante el **Elbow Test**, evaluando la reducción marginal del WCSS al aumentar *k* entre 1 y 10, con 25 inicializaciones aleatorias (`nstart = 25`) para reducir la sensibilidad al punto de inicio. El quiebre se observa consistentemente en **k = 5** en las tres configuraciones.
+
+### Etapa 2: Random Forest
+
+La segunda etapa aplica un **Random Forest** para identificar los factores más determinantes en la formación de parejas mixtas. La variable dependiente es `native_couple`. El modelo se estima en modo de estimación de probabilidades (`probability = TRUE`). Los datos se dividen en entrenamiento (70%) y prueba (30%) con semilla `998213`.
+
+Los parámetros utilizados son los estándares de referencia:
+
+| Parámetro | Valor |
+|---|---|
+| `num.trees` | 1.000 |
+| `mtry` | 4 |
+| `min.node.size` | 50 |
+| `importance` | impurity (disminución de Gini) |
+
+Al igual que el clustering, el modelo se estima en las tres configuraciones para evaluar la estabilidad del ordenamiento de variables.
+
+---
+
+## Resultados
+
+### Configuración 1: Parejas con al menos un integrante no nativo
+
+```{r config1}
+#| label: config1
+#| code-summary: "Clustering — Configuración 1"
+
+filtro_c1 <- c("Native-Nonnative", "Nonnative-Native", "Nonnative-Nonnative")
+c1 <- preparar_y_clusterizar(chi_couples_stats, filtro_c1)
+```
+
+#### Elbow Test
+
+```{r elbow-c1}
+#| label: elbow-c1
+#| fig-cap: "Elbow Test — Configuración 1 (parejas con migrantes)"
+#| code-summary: "Elbow Test — Configuración 1"
+
+c1$elbow
+```
+
+#### Distribución de clusters
+
+```{r dist-c1}
+#| label: dist-c1
+#| code-summary: "Distribución por cluster — Configuración 1"
+
+knitr::kable(c1$distribucion, caption = "Distribución de observaciones por cluster — Configuración 1")
+```
+
+#### Perfiles de centroides
+
+| Variable | Cluster 1 | Cluster 2 | Cluster 3 | Cluster 4 | Cluster 5 |
+|---|---|---|---|---|---|
+| Native-Nonnative | 0.15 | 0.25 | 0.15 | 0.15 | 0.29 |
+| Nonnative-Native | 0.15 | 0.13 | 0.05 | 0.11 | 0.16 |
+| Nonnative-Nonnative | 0.70 | 0.62 | 0.79 | 0.75 | 0.55 |
+| Dif. edad: Hombre Mayor | 0.00 | 1.00 | 1.00 | 0.00 | 0.52 |
+| Dif. edad: Mujer Mayor | 1.00 | 0.00 | 0.00 | 0.00 | 0.17 |
+| Dif. edad: Misma Edad | 0.00 | 0.00 | 0.00 | 1.00 | 0.31 |
+| Educación: Univ-Univ | 0.22 | 0.54 | 0.00 | 0.33 | 0.55 |
+| Educación: NoUniv-NoUniv | 0.53 | 0.00 | 1.00 | 0.46 | 0.11 |
+| Con hijos | 0.95 | 1.00 | 0.86 | 0.96 | 0.00 |
+| Sin hijos | 0.05 | 0.00 | 0.14 | 0.04 | 1.00 |
+| Área urbana | 0.96 | 0.96 | 0.95 | 0.96 | 0.97 |
+
+: Perfiles de centroides — Configuración 1 {#tbl-c1}
+
+Los clusters se definen principalmente por tres ejes: la **diferencia de edad**, el **nivel educativo de la díada** y la **presencia de hijos**. El cluster 5 es el único sin hijos y con alto capital educativo en ambos integrantes. Los clusters 1 y 3 concentran parejas con baja educación; el 2 y el 5 agrupan las de mayor nivel universitario.
+
+#### Random Forest — Configuración 1
+
+```{r rf-c1}
+#| label: rf-c1
+#| fig-cap: "Importancia de variables — RF Configuración 1 (parejas con migrantes)"
+#| code-summary: "Random Forest — Configuración 1"
+
+chi_forest_c1 <- chi_couples_stats %>%
+  filter(native_couple %in% filtro_c1) %>%
+  drop_na() %>%
+  dplyr::select(age_diff, educ_cat_couple, native_couple, religion_couple,
+                status_wf_couple, ocupation_couple, children_couple, area_couple) %>%
+  mutate(native_couple = as.factor(native_couple))
+
+idx_c1    <- sample(seq_len(nrow(chi_forest_c1)), size = 0.7 * nrow(chi_forest_c1))
+train_c1  <- chi_forest_c1[idx_c1, ]
+
+rf_c1 <- ranger(
+  x = train_c1 %>% dplyr::select(-native_couple),
+  y = train_c1$native_couple,
+  probability   = TRUE,
+  num.trees     = 1000,
+  mtry          = 4,
+  min.node.size = 50,
+  importance    = "impurity",
+  seed          = 998213
+)
+
+imp_c1 <- data.frame(
+  variable   = names(rf_c1$variable.importance),
+  importance = rf_c1$variable.importance,
+  config     = "Config 1: Solo parejas con migrantes"
+) %>% arrange(desc(importance))
+
+ggplot(imp_c1, aes(x = reorder(variable, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(x = "Variable", y = "Importancia (Gini)") +
+  theme_minimal()
+```
+
+Con una muestra restringida a parejas con al menos un integrante no nativo (n entrenamiento = 164.751; OOB Brier Score = **0.2554**), la **ocupación** es el predictor dominante, pero la **religión** asciende al segundo lugar desplazando a la educación. El OOB más alto de las tres configuraciones indica que esta es la tarea predictiva más difícil.
+
+---
+
+### Configuración 2: Muestra completa
+
+```{r config2}
+#| label: config2
+#| code-summary: "Clustering — Configuración 2"
+
+filtro_c2 <- c("Native-Native", "Native-Nonnative", "Nonnative-Native", "Nonnative-Nonnative")
+c2 <- preparar_y_clusterizar(chi_couples_stats, filtro_c2)
+```
+
+#### Elbow Test
+
+```{r elbow-c2}
+#| label: elbow-c2
+#| fig-cap: "Elbow Test — Configuración 2 (muestra completa)"
+#| code-summary: "Elbow Test — Configuración 2"
+
+c2$elbow
+```
+
+#### Distribución de clusters
+
+```{r dist-c2}
+#| label: dist-c2
+#| code-summary: "Distribución por cluster — Configuración 2"
+
+knitr::kable(c2$distribucion, caption = "Distribución de observaciones por cluster — Configuración 2")
+```
+
+#### Perfiles de centroides
+
+| Variable | Cluster 1 | Cluster 2 | Cluster 3 | Cluster 4 | Cluster 5 |
+|---|---|---|---|---|---|
+| Native-Native | 0.85 | 0.82 | 0.81 | 0.75 | 0.86 |
+| Nonnative-Nonnative | 0.09 | 0.12 | 0.15 | 0.16 | 0.08 |
+| Educación: Univ-Univ | 0.37 | 0.98 | 0.00 | 0.55 | 0.32 |
+| Educación: NoUniv-NoUniv | 0.38 | 0.00 | 0.67 | 0.20 | 0.44 |
+| Religión: Sin religión | 1.00 | 0.00 | 0.00 | 0.29 | 0.00 |
+| Religión: Misma religión | 0.00 | 1.00 | 1.00 | 0.43 | 0.00 |
+| Religión: Distinta religión | 0.00 | 0.00 | 0.00 | 0.28 | 1.00 |
+| Con hijos | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 |
+| Área rural | 0.09 | 0.09 | 0.14 | 0.06 | 0.10 |
+
+: Perfiles de centroides — Configuración 2 {#tbl-c2}
+
+El eje diferenciador dominante en esta configuración es la **religión**: los clusters 1, 2 y 3 quedan definidos por ser exclusivamente sin religión, misma religión, y misma religión con baja educación, respectivamente. El cluster 4 es el único sin hijos con distribución religiosa mixta.
+
+#### Random Forest — Configuración 2
+
+```{r rf-c2}
+#| label: rf-c2
+#| fig-cap: "Importancia de variables — RF Configuración 2 (muestra completa)"
+#| code-summary: "Random Forest — Configuración 2"
+
+chi_forest_c2 <- chi_couples_stats %>%
+  filter(native_couple %in% filtro_c2) %>%
+  drop_na() %>%
+  dplyr::select(age_diff, educ_cat_couple, native_couple, religion_couple,
+                status_wf_couple, ocupation_couple, children_couple, area_couple) %>%
+  mutate(native_couple = as.factor(native_couple))
+
+idx_c2   <- sample(seq_len(nrow(chi_forest_c2)), size = 0.7 * nrow(chi_forest_c2))
+train_c2 <- chi_forest_c2[idx_c2, ]
+
+rf_c2 <- ranger(
+  x = train_c2 %>% dplyr::select(-native_couple),
+  y = train_c2$native_couple,
+  probability   = TRUE,
+  num.trees     = 1000,
+  mtry          = 4,
+  min.node.size = 50,
+  importance    = "impurity",
+  seed          = 998213
+)
+
+imp_c2 <- data.frame(
+  variable   = names(rf_c2$variable.importance),
+  importance = rf_c2$variable.importance,
+  config     = "Config 2: Muestra completa"
+) %>% arrange(desc(importance))
+
+ggplot(imp_c2, aes(x = reorder(variable, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "darkorange") +
+  coord_flip() +
+  labs(x = "Variable", y = "Importancia (Gini)") +
+  theme_minimal()
+```
+
+Con la muestra completa (n entrenamiento = 906.880; OOB Brier Score = **0.1651**), el ordenamiento es estable: ocupación, educación, área y religión. Los valores de importancia de las tres variables intermedias son similares entre sí.
+
+---
+
+### Configuración 3: Parejas homógamas en origen
+
+```{r config3}
+#| label: config3
+#| code-summary: "Clustering — Configuración 3"
+
+filtro_c3 <- c("Native-Native", "Nonnative-Nonnative")
+c3 <- preparar_y_clusterizar(chi_couples_stats, filtro_c3)
+```
+
+#### Elbow Test
+
+```{r elbow-c3}
+#| label: elbow-c3
+#| fig-cap: "Elbow Test — Configuración 3 (parejas homógamas)"
+#| code-summary: "Elbow Test — Configuración 3"
+
+c3$elbow
+```
+
+#### Distribución de clusters
+
+```{r dist-c3}
+#| label: dist-c3
+#| code-summary: "Distribución por cluster — Configuración 3"
+
+knitr::kable(c3$distribucion, caption = "Distribución de observaciones por cluster — Configuración 3")
+```
+
+#### Perfiles de centroides
+
+| Variable | Cluster 1 | Cluster 2 | Cluster 3 | Cluster 4 | Cluster 5 |
+|---|---|---|---|---|---|
+| Native-Native | 1.00 | 0.00 | 0.95 | 1.00 | 1.00 |
+| Nonnative-Nonnative | 0.00 | 1.00 | 0.05 | 0.00 | 0.00 |
+| Educación: Univ-Univ | 1.00 | 0.25 | 0.62 | 0.00 | 0.00 |
+| Educación: NoUniv-NoUniv | 0.00 | 0.51 | 0.13 | 0.64 | 0.66 |
+| Con hijos | 1.00 | 0.83 | 0.00 | 0.99 | 0.99 |
+| Dif. edad: Hombre Mayor | 0.49 | 0.52 | 0.48 | 0.00 | 1.00 |
+| Dif. edad: Misma Edad | 0.35 | 0.26 | 0.37 | 0.57 | 0.00 |
+| Área rural | 0.10 | 0.02 | 0.06 | 0.13 | 0.16 |
+
+: Perfiles de centroides — Configuración 3 {#tbl-c3}
+
+El cluster 2 concentra prácticamente la totalidad de las parejas no nativas-no nativas. Sus características distintivas son una menor proporción universitaria y mayor presencia urbana. Los clusters nativos se diferencian principalmente por educación (cluster 1: universitario; clusters 4 y 5: no universitario) y presencia de hijos (cluster 3: sin hijos).
+
+#### Random Forest — Configuración 3
+
+```{r rf-c3}
+#| label: rf-c3
+#| fig-cap: "Importancia de variables — RF Configuración 3 (parejas homógamas)"
+#| code-summary: "Random Forest — Configuración 3"
+
+chi_forest_c3 <- chi_couples_stats %>%
+  filter(native_couple %in% filtro_c3) %>%
+  drop_na() %>%
+  dplyr::select(age_diff, educ_cat_couple, native_couple, religion_couple,
+                status_wf_couple, ocupation_couple, children_couple, area_couple) %>%
+  mutate(native_couple = as.factor(native_couple))
+
+idx_c3   <- sample(seq_len(nrow(chi_forest_c3)), size = 0.7 * nrow(chi_forest_c3))
+train_c3 <- chi_forest_c3[idx_c3, ]
+
+rf_c3 <- ranger(
+  x = train_c3 %>% dplyr::select(-native_couple),
+  y = train_c3$native_couple,
+  probability   = TRUE,
+  num.trees     = 1000,
+  mtry          = 4,
+  min.node.size = 50,
+  importance    = "impurity",
+  seed          = 998213
+)
+
+imp_c3 <- data.frame(
+  variable   = names(rf_c3$variable.importance),
+  importance = rf_c3$variable.importance,
+  config     = "Config 3: Solo homógamas en origen"
+) %>% arrange(desc(importance))
+
+ggplot(imp_c3, aes(x = reorder(variable, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  coord_flip() +
+  labs(x = "Variable", y = "Importancia (Gini)") +
+  theme_minimal()
+```
+
+Al comparar solo parejas nativas-nativas con no nativas-no nativas (n entrenamiento = 854.954; OOB Brier Score = **0.1043**), el modelo alcanza su mejor desempeño. La diferencia de edad cae al valor más bajo entre las tres configuraciones, sugiriendo que diferencia menos entre grupos homógamos en origen.
+
+---
+
+### Comparación entre configuraciones
+
+```{r rf-comparacion}
+#| label: rf-comparacion
+#| fig-cap: "Comparación de importancia de variables entre las tres configuraciones"
+#| code-summary: "Gráfico comparativo — tres configuraciones del RF"
+
+imp_all <- bind_rows(imp_c1, imp_c2, imp_c3)
+
+ggplot(imp_all, aes(x = reorder(variable, importance), y = importance, fill = config)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("steelblue", "darkorange", "forestgreen")) +
+  labs(x = "Variable", y = "Importancia (Gini)", fill = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+| Variable | Config 1 (migrantes) | Config 2 (completa) | Config 3 (homógamas) |
+|---|---|---|---|
+| `ocupation_couple` | 4.271 (**1°**) | 6.712 (**1°**) | 7.163 (**1°**) |
+| `religion_couple` | 2.426 (**2°**) | 2.570 (**4°**) | 2.638 (**4°**) |
+| `educ_cat_couple` | 1.283 (**3°**) | 3.150 (**2°**) | 2.913 (**2°**) |
+| `area_couple` | 681 (**4°**) | 2.833 (**3°**) | 2.675 (**3°**) |
+| `age_diff` | 533 (**5°**) | 601 (**6°**) | 366 (**6°**) |
+| `children_couple` | 193 (**6°**) | 1.636 (**5°**) | 1.612 (**5°**) |
+| `status_wf_couple` | 0 (**7°**) | 0 (**7°**) | 0 (**7°**) |
+| **OOB Brier Score** | **0.2554** | **0.1651** | **0.1043** |
+
+: Comparación de importancia de variables entre configuraciones {#tbl-rf-comp}
+
+Dos patrones destacan. Primero, la **ocupación** es el predictor dominante en las tres configuraciones, lo que sugiere que la estructura ocupacional de la díada es el factor más asociado al tipo de pareja en términos de origen, independientemente de cómo se delimite la muestra. Segundo, la **religión** asciende al segundo lugar únicamente cuando la muestra se restringe a parejas con migrantes, lo que indica que este factor tiene un peso diferencial en la formación de parejas mixtas respecto a la población general.
+
+---
+
+## Análisis
+
+En forma de sintesis, los resultados entregados fueron los siguientes:
+
+**Clusters C1 (solo parejas con migrantes)**
+
+Los cinco clusters se estructuran en torno a diferencia de edad, nivel educativo y presencia de hijos. La composición de origen es estable entre clusters — predominan las parejas Nonnative-Nonnative en todos (~55–79%) — por lo que las tipologías no separan grupos por origen sino por estructura sociodemográfica de la díada.
+
+- **Cluster 1** — mujer mayor en el 100% de los casos, educación no universitaria mayoritaria (53%), con hijos (95%). Perfil socioeconómico bajo.
+- **Cluster 2** — hombre siempre mayor (100%), alta prevalencia universitaria en ambos (54%), todos con hijos (100%). Perfil socioeconómico alto.
+- **Cluster 3** — hombre mayor (100%), opuesto al cluster 2 en educación: todos no universitarios (100%). Perfil obrero, con leve presencia de parejas sin hijos (14%).
+- **Cluster 4** — igualdad de edad como rasgo definitorio (100%), distribución educativa intermedia, casi todos con hijos (96%).
+- **Cluster 5** — único cluster sin hijos (100%), mayor proporción universitaria (55%). Probablemente parejas jóvenes en etapas tempranas de la relación.
+
+---
+
+**Clusters C2 (muestra completa)**
+
+Al incorporar toda la muestra, la religión emerge como eje organizador principal, desplazando a la diferencia de edad. Esto indica que en el universo completo de parejas heterosexuales chilenas, la homogamia religiosa es un clivaje estructurante más potente que la brecha etaria.
+
+- **Cluster 1** — totalidad sin religión (100%), distribución educativa intermedia, todos con hijos.
+- **Cluster 2** — misma religión (100%) y máximo nivel educativo (98% universitario-universitario), todos con hijos. Élite educativa religiosa.
+- **Cluster 3** — misma religión (100%), baja educación (67% no universitario-no universitario), mayor ruralidad (14%), todos con hijos. Perfil popular religioso.
+- **Cluster 4** — único sin hijos (100%), distribución religiosa heterogénea, mayor proporción Nonnative-Nonnative (16%). Probablemente parejas jóvenes urbanas.
+- **Cluster 5** — distinta religión (100%), distribución educativa mixta, todos con hijos.
+
+---
+
+**Clusters C3 (homógamas en origen)**
+
+Al restringir la muestra a parejas homógamas, el algoritmo segrega casi perfectamente los dos grupos de origen. El cluster 2 captura prácticamente en su totalidad a las parejas Nonnative-Nonnative (100%), mientras los clusters 1, 4 y 5 son exclusivos de Native-Native (≥95%). Dentro de cada grupo, los clusters se diferencian por educación, hijos y diferencia de edad.
+
+- **Cluster 1** — Native-Native universitario con hijos (100% universitario-universitario, todos con hijos), diferencia de edad mixta.
+- **Cluster 2** — Nonnative-Nonnative, educación predominantemente no universitaria (51%), mayoría con hijos (83%), marcadamente más urbano que los clusters nativos comparables (solo 2% rural).
+- **Cluster 3** — Native-Native sin hijos (100%), educación media-alta (62% universitario-universitario). Segmento más joven de parejas nativas.
+- **Cluster 4** — Native-Native, igualdad de edad (57%), baja educación (64% no universitario-no universitario), con hijos (99%), mayor ruralidad relativa (13%).
+- **Cluster 5** — Native-Native, baja educación, hombre siempre mayor (100%), con hijos (99%), el más rural de los clusters nativos (16%).
+
+---
+
+**Random Forest — Importancia de variables**
+
+Tres patrones emergen de la comparación entre configuraciones.
+
+La **ocupación** (`ocupation_couple`) es el predictor dominante en las tres configuraciones, con una importancia Gini entre 2 y 5 veces superior a la siguiente variable. La posición en la estructura ocupacional es el atributo más asociado al tipo de pareja en términos de origen, independientemente de cómo se delimite la muestra.
+
+La **situación laboral** (`status_wf_couple`) obtiene importancia 0 en las tres configuraciones. Al estar la muestra filtrada a parejas Ocupado-Ocupado, esta variable no tiene varianza y no aporta información al modelo. Es un resultado esperado por diseño del filtro.
+
+La **religión** (`religion_couple`) presenta un comportamiento diferencial: en la muestra restringida a parejas con migrantes (Config COMPLETA) asciende al segundo lugar (2.426), superando a educación (1.283) y área (681). En las otras dos configuraciones ocupa el cuarto lugar. Este desplazamiento sugiere que la homogamia religiosa tiene un rol particular en la selección de pareja dentro de la población migrante, coherente con la idea de que la religión opera como marcador identitario y red de sociabilidad en contextos de migración — lo que conecta directamente con el marco de homofilia planteado en la introducción.
+
+
+
