@@ -1,6 +1,6 @@
 # mixcouples_latam
 
-Parejas mixtas en América Latina — estudio de emparejamiento selectivo (assortative mating) y homofilia en parejas convivientes a partir de censos latinoamericanos, con foco en el emparejamiento nativo/no nativo.
+Parejas mixtas en América Latina — estudio de emparejamiento selectivo (assortative mating) y homofilia en parejas convivientes a partir de censos latinoamericanos, con foco en el emparejamiento[...]
 
 ## Estructura
 
@@ -13,7 +13,7 @@ chile/
   diccionario_variables_censo2024.xlsx # diccionario de variables, Censo 2024
 ```
 
-Cada país tiene su propia carpeta de nivel superior (ej. `chile/`), siguiendo el mismo patrón: un script de construcción, un dataset a nivel de pareja, un reporte Quarto, y los diccionarios de datos fuente.
+Cada país tiene su propia carpeta de nivel superior (ej. `chile/`), siguiendo el mismo patrón: un script de construcción, un dataset a nivel de pareja, un reporte Quarto, y los diccionarios de [...]
 
 ## Chile — Censo 2024
 
@@ -41,3 +41,11 @@ quarto::quarto_render("chile/reporte_parejas_censo2024.qmd")
 ```
 
 Requiere: `tidyverse`, `fastDummies`, `cluster`, `ranger`, `ggplot2`, `poLCA`, `vip`, `pROC`.
+
+
+Ver el reporte (HTML renderizado) en el navegador
+
+- Vista rápida (htmlpreview): https://htmlpreview.github.io/?https://raw.githubusercontent.com/mebucca/mixcouples_latam/master/chile/reporte_parejas_censo2024.html
+- Alternativa (raw.githack): https://raw.githack.com/mebucca/mixcouples_latam/master/chile/reporte_parejas_censo2024.html
+
+Nota: GitHub no renderiza HTML directamente desde el repositorio por razones de seguridad; las URLs anteriores usan servicios externos que sirven el archivo HTML crudo para que puedas verlo como página en el navegador.
